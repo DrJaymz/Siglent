@@ -1,4 +1,5 @@
 __pycache__/
 captures/
 *.csv
+*.log
 siglent_viewer.json

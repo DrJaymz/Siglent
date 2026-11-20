@@ -31,6 +31,7 @@ APP_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = APP_DIR / "siglent_viewer.json"
 CAPTURE_DIR = APP_DIR / "captures"
 SETUP_DIR = APP_DIR / "setups"
+LOG_FILE = APP_DIR / "siglent_viewer.log"
 GRID_DIVS = 14          # horizontal divisions on the SDS1000X-E
 CODES_PER_DIV = 25      # waveform ADC codes per vertical division
 SETTLE_TIME = 0.25      # seconds to leave the scope alone after a settings change
@@ -58,6 +59,21 @@ BLUE = "#3b82f6"
 
 class ScopeError(Exception):
     pass
+
+
+_log_lock = threading.Lock()
+
+
+def log(message):
+    """Append a timestamped line to the flight-recorder log."""
+    try:
+        with _log_lock:
+            if LOG_FILE.exists() and LOG_FILE.stat().st_size > 2_000_000:
+                LOG_FILE.replace(LOG_FILE.with_suffix(".old.log"))
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {message}\n")
+    except OSError:
+        pass
 
 
 def value_of(resp):
@@ -110,14 +126,34 @@ class Scope:
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 21)
         self._quiet_until = 0.0
+        self.last_cmd = ""
 
     def close(self):
+        """Close politely (FIN, not reset): the scope copes badly with resets."""
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             self.sock.close()
         except OSError:
             pass
 
+    def drain(self, idle=0.5):
+        """Discard incoming data until the line has been quiet for `idle` s."""
+        self.sock.settimeout(idle)
+        count = 0
+        try:
+            while True:
+                chunk = self.sock.recv(1 << 20)
+                if not chunk:
+                    raise ScopeError("connection closed by scope")
+                count += len(chunk)
+        except socket.timeout:
+            return count
+
     def send(self, cmd):
+        self.last_cmd = cmd
         # The scope silently discards anything that arrives within ~0.1 s of a
         # settings change, so hold off after every non-query command.
         wait = self._quiet_until - time.monotonic()
@@ -236,6 +272,7 @@ class Worker(threading.Thread):
         self.on_status = None             # callback(text, connected)
         self.on_poll = None               # callback(dict)
         self._reconnect = threading.Event()
+        self._stop = False
         self._seq = 0
 
     def set_host(self, host):
@@ -249,25 +286,45 @@ class Worker(threading.Thread):
         if callback:
             self.ui_queue.put((callback, args))
 
+    def stop(self):
+        """Ask the thread to finish its current request and close cleanly."""
+        self._stop = True
+        self._reconnect.set()
+
     def run(self):
-        while True:
+        failures = 0        # consecutive short-lived or failed connections
+        while not self._stop:
             self._reconnect.clear()
             host = self.host
             self._ui(self.on_status, f"Connecting to {host}…", False)
+            scope = None
             try:
                 scope = Scope(host)
                 idn = scope.query("*IDN?")
             except (OSError, ScopeError) as e:
+                if scope:
+                    scope.close()
+                failures += 1
+                log(f"connect to {host} failed: {e!r}")
                 self._ui(self.on_status, f"Cannot reach {host}: {e}", False)
                 self._drop_jobs()
-                self._reconnect.wait(2)
+                self._reconnect.wait(min(15, 2 * failures))
                 continue
+            log(f"connected to {host}: {idn}")
             self._ui(self.on_status, idn.replace(",", "  "), True)
+            started = time.monotonic()
             try:
                 self._session(scope)
+                log("connection closed by viewer")
             except (OSError, ScopeError, ValueError, TypeError) as e:
+                # Reconnecting too eagerly is hard on the scope: back off if
+                # connections keep failing soon after they open.
+                failures = 0 if time.monotonic() - started > 30 else failures + 1
+                wait = min(15, 1 + 2 * failures)
+                log(f"CONNECTION LOST after {time.monotonic() - started:.0f} s, last command "
+                    f"{scope.last_cmd!r}: {e!r}; retrying in {wait} s")
                 self._ui(self.on_status, f"Connection lost: {e}", False)
-                self._reconnect.wait(1)
+                self._reconnect.wait(wait)
             finally:
                 scope.close()
 
@@ -283,36 +340,72 @@ class Worker(threading.Thread):
     def _session(self, scope):
         self.next_poll = 0.0
         times = []
+        misses = 0                          # consecutive unanswered requests
+        health = {"since": time.monotonic(), "frames": 0, "shot": 0.0,
+                  "shot_max": 0.0, "poll_max": 0.0, "misses": 0}
         while not self._reconnect.is_set():
             try:
-                while True:
-                    fn, callback = self.jobs.get_nowait()
-                    self.jobs_done += 1
-                    try:
-                        result = fn(scope)
-                    except socket.timeout:
-                        self._ui(callback, ScopeError("no response (timeout)"))
-                        raise               # stream may be out of sync: reconnect
-                    self._ui(callback, result)
-            except queue.Empty:
-                pass
-            if time.monotonic() >= self.next_poll:
-                self.next_poll = time.monotonic() + 1.0
-                self._ui(self.on_poll, self._poll(scope))
-            if self.streaming:
-                bmp = scope.screenshot()
-                img = Image.open(io.BytesIO(bmp))
-                img.load()
-                self._seq += 1
-                self.frame = (self._seq, img.convert("RGB"))
-                times.append(time.monotonic())
-                times = times[-15:]
-                if len(times) > 1:
-                    self.fps = (len(times) - 1) / (times[-1] - times[0])
-            else:
-                self.fps = 0.0
-                times.clear()
-                time.sleep(0.03)
+                self._step(scope, times, health)
+                misses = 0
+            except socket.timeout:
+                # The scope missed a request. Dropping the connection and opening
+                # another is hard on it, so resynchronise on this one instead.
+                misses += 1
+                health["misses"] += 1
+                late = scope.drain()
+                log(f"NO ANSWER #{misses} to {scope.last_cmd!r} "
+                    f"({late} late bytes discarded)")
+                if misses >= 3:
+                    raise ScopeError(f"scope stopped answering ({scope.last_cmd})")
+            if time.monotonic() - health["since"] >= 60:
+                n = health["frames"]
+                log(f"health: {n} frames, screenshot avg "
+                    f"{health['shot'] / n * 1000 if n else 0:.0f} ms max "
+                    f"{health['shot_max'] * 1000:.0f} ms, poll max "
+                    f"{health['poll_max'] * 1000:.0f} ms, unanswered {health['misses']}")
+                health.update(since=time.monotonic(), frames=0, shot=0.0,
+                              shot_max=0.0, poll_max=0.0, misses=0)
+
+    def _step(self, scope, times, health):
+        """One pass of the worker loop: queued jobs, a poll if due, one frame."""
+        try:
+            while True:
+                fn, callback = self.jobs.get_nowait()
+                self.jobs_done += 1
+                try:
+                    result = fn(scope)
+                except socket.timeout:
+                    self._ui(callback, ScopeError("no response (timeout)"))
+                    raise
+                self._ui(callback, result)
+        except queue.Empty:
+            pass
+        if time.monotonic() >= self.next_poll:
+            self.next_poll = time.monotonic() + 1.0
+            t = time.monotonic()
+            self._ui(self.on_poll, self._poll(scope))
+            health["poll_max"] = max(health["poll_max"], time.monotonic() - t)
+        if self.streaming:
+            t = time.monotonic()
+            bmp = scope.screenshot()
+            taken = time.monotonic() - t
+            health["frames"] += 1
+            health["shot"] += taken
+            health["shot_max"] = max(health["shot_max"], taken)
+            if taken > 1.5:
+                log(f"slow screenshot: {taken:.1f} s")
+            img = Image.open(io.BytesIO(bmp))
+            img.load()
+            self._seq += 1
+            self.frame = (self._seq, img.convert("RGB"))
+            times.append(time.monotonic())
+            del times[:-15]
+            if len(times) > 1:
+                self.fps = (len(times) - 1) / (times[-1] - times[0])
+        else:
+            self.fps = 0.0
+            times.clear()
+            time.sleep(0.03)
 
     def _poll(self, scope):
         q = scope.query
@@ -1008,6 +1101,9 @@ class App:
         os.startfile(SETUP_DIR)
 
     def _close(self):
+        self.worker.stop()          # let it finish the request in flight,
+        self.worker.join(2.0)       # then close the connection cleanly
+        log("viewer closed")
         self.settings["geometry"] = self.root.geometry()
         self._save_settings()
         self.root.destroy()
@@ -1022,6 +1118,7 @@ def main():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SiglentViewer")
     except (AttributeError, OSError):
         pass
+    log(f"viewer started (process {os.getpid()})")
     root = tk.Tk()
     try:
         root.iconbitmap(default=str(APP_DIR / "siglent_viewer.ico"))
