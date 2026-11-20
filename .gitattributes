@@ -1,0 +1,2 @@
+# scope setup files must go back to the scope byte-for-byte
+setups/*.xml -text
