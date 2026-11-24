@@ -25,6 +25,8 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 from PIL import Image, ImageTk
 
+__version__ = "1.1"
+
 DEFAULT_IP = "192.168.0.202"
 PORT = 5025
 APP_DIR = Path(__file__).resolve().parent
@@ -520,7 +522,7 @@ class App:
         self.root = root
         self.settings = self._load_settings()
         host = host or self.settings.get("ip", DEFAULT_IP)
-        root.title("Siglent Viewer")
+        root.title(f"Siglent Viewer {__version__}")
         apply_dark_theme(root)
         self.ui_queue = queue.Queue()
         self.worker = Worker(host, self.ui_queue)
@@ -1118,7 +1120,7 @@ def main():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SiglentViewer")
     except (AttributeError, OSError):
         pass
-    log(f"viewer started (process {os.getpid()})")
+    log(f"viewer {__version__} started (process {os.getpid()})")
     root = tk.Tk()
     try:
         root.iconbitmap(default=str(APP_DIR / "siglent_viewer.ico"))
