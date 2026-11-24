@@ -127,6 +127,10 @@ responsive.
 - **1.0** — First release: live view, screenshots, front-panel controls,
   measurements, CSV export and setup save and restore.
 
+## Licence
+
+Released under the [MIT License](LICENSE): free to use, modify and share.
+
 ## Disclaimer
 
 This is an independent project. It is not affiliated with or endorsed by
